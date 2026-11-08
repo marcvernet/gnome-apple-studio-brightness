@@ -1,0 +1,8 @@
+{
+  "uuid": "apple-studio-brightness@marcvernet",
+  "name": "Apple Studio Display Brightness",
+  "description": "Adjust Apple Studio Display brightness from the GNOME control centre and keyboard brightness keys, via the display's USB interface",
+  "shell-version": ["51", "51.x"],
+  "url": "https://github.com/marcvernet/apple-studio-brightness",
+  "settings-schema": "org.gnome.shell.extensions.apple-studio-brightness"
+}

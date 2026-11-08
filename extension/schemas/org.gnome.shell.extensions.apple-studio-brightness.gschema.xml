@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.apple-studio-brightness"
+          path="/org/gnome/shell/extensions/apple-studio-brightness/">
+    <key name="match-vendor" type="s">
+      <default>'APP'</default>
+      <summary>EDID vendor of the target display</summary>
+      <description>Three letter EDID vendor code of the display to control (Apple Studio Display: APP).</description>
+    </key>
+    <key name="match-product" type="s">
+      <default>'StudioDisplay'</default>
+      <summary>EDID product name of the target display</summary>
+      <description>Product reported by mutter for the display to control (Apple Studio Display: StudioDisplay). Empty string matches any product from the vendor.</description>
+    </key>
+    <key name="hidraw-device" type="s">
+      <default>''</default>
+      <summary>Explicit /dev/hidrawN node</summary>
+      <description>Override the auto-detected USB HID interface node (e.g. /dev/hidraw8). Empty = auto-detect.</description>
+    </key>
+    <key name="poll-interval-secs" type="i">
+      <default>30</default>
+      <summary>External change poll interval</summary>
+      <description>Seconds between checks for brightness changes made outside GNOME. 0 disables polling.</description>
+    </key>
+    <key name="debounce-ms" type="i">
+      <default>100</default>
+      <summary>Debounce for USB writes</summary>
+      <description>Milliseconds to coalesce slider movements into one CLI invocation.</description>
+    </key>
+    <key name="min-brightness" type="d">
+      <default>0.0</default>
+      <summary>Minimum brightness (0..1)</summary>
+      <description>Clamp brightness so the display never goes below this fraction.</description>
+    </key>
+    <key name="max-brightness" type="d">
+      <default>1.0</default>
+      <summary>Maximum brightness (0..1)</summary>
+      <description>Clamp brightness so the display never goes above this fraction.</description>
+    </key>
+    <key name="brightness-curve" type="d">
+      <default>2.2</default>
+      <range min="0.5" max="4.0"/>
+      <summary>Slider response curve (gamma)</summary>
+      <description>Perceived-brightness exponent applied to the slider position: raw = min + position^curve * (max - min). 1.0 is linear; 2.2 (default) mimics the macOS slider, making the lower half of the slider reach genuinely dim levels. Raise it if the low end still feels too bright.</description>
+    </key>
+    <key name="ignore-ambient" type="b">
+      <default>true</default>
+      <summary>Let the slider own the brightness</summary>
+      <description>GNOME blends the laptop's ambient-light-sensor target into every brightness write, which stops an external display from reaching its dim end. When true (default) the slider position is written verbatim, as macOS does, while idle dimming still applies. Set false to let auto-brightness bias this display too.</description>
+    </key>
+    <key name="auto-brightness" type="b">
+      <default>false</default>
+      <summary>Auto brightness from the display's own light sensor</summary>
+      <description>Use the Studio Display's built-in ambient light sensor (exposed over USB by the kernel hid-sensor-als driver) to move the brightness slider automatically, like macOS. Moving the slider while enabled sets a personal offset that is kept.</description>
+    </key>
+    <key name="als-interval-secs" type="i">
+      <default>2</default>
+      <range min="1" max="300"/>
+      <summary>Ambient light poll interval</summary>
+      <description>Seconds between ambient light sensor readings when auto-brightness is enabled.</description>
+    </key>
+    <key name="als-min-lux" type="d">
+      <default>20.0</default>
+      <range min="0.5" max="10000.0"/>
+      <summary>Illuminance reading that maps to the dim end</summary>
+      <description>Ambient reading (studio-brightness als) at or below which the slider is driven to auto-brightness-min-value. The Studio Display's sensor reports roughly 16-40 fully covered and about 19000 in a normally lit room, so the scale runs well ahead of true lux.</description>
+    </key>
+    <key name="als-max-lux" type="d">
+      <default>200000.0</default>
+      <range min="100.0" max="1000000.0"/>
+      <summary>Illuminance reading that maps to the bright end</summary>
+      <description>Ambient reading (studio-brightness als) at or above which the slider is driven to auto-brightness-max-value. About ten times a normally lit room.</description>
+    </key>
+    <key name="als-min-value" type="d">
+      <default>0.1</default>
+      <range min="0.0" max="1.0"/>
+      <summary>Slider target in the dark</summary>
+      <description>Slider position auto-brightness drives the display to in dark rooms.</description>
+    </key>
+    <key name="als-max-value" type="d">
+      <default>0.95</default>
+      <range min="0.0" max="1.0"/>
+      <summary>Slider target in bright light</summary>
+      <description>Slider position auto-brightness drives the display to in bright light.</description>
+    </key>
+    <key name="als-bias" type="d">
+      <default>0.0</default>
+      <range min="-1.0" max="1.0"/>
+      <summary>User offset for auto brightness</summary>
+      <description>Offset added to the sensor-driven slider position. Adjusted automatically when you move the slider while auto-brightness is on; the offset persists across sessions.</description>
+    </key>
+  </schema>
+</schemalist>

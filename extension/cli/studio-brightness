@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+"""studio-brightness — control Apple Studio Display brightness from Linux.
+
+The Studio Display has no DDC/CI slave; macOS (and this tool) drive its
+backlight through a USB HID feature report on the display's vendor interface:
+
+    report = [0x01, brightness:u32-le, unknown:u16-le]   (400 <= nits <= 60000)
+
+which is sent with HIDIOCSFEATURE to the display's /dev/hidrawN node.
+
+Commands:
+    studio-brightness get            # raw=... percent=... hidraw=...
+    studio-brightness set 30000      # raw nits value
+    studio-brightness set-percent 60 # percentage
+    studio-brightness probe          # show candidate hidraw nodes
+"""
+import fcntl
+import glob
+import os
+import struct
+import sys
+
+VENDOR = 0x05AC
+PRODUCTS = (0x1114, 0x1116, 0x1118)  # Studio Display 2022, XDR 2026, SD 2026
+MIN_BRIGHTNESS = 400
+MAX_BRIGHTNESS = 60000
+REPORT_LEN = 7  # report id (1) + u32 brightness + u16 unknown
+
+# HIDIOCSFEATURE(7) / HIDIOCGFEATURE(7), see linux/hidraw.h
+HIDIOCGFEATURE = 0xC0074807
+HIDIOCSFEATURE = 0xC0074806
+
+
+class DisplayError(Exception):
+    pass
+
+
+def _read_attr(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def find_hidraw_nodes():
+    """/dev/hidrawN nodes of the Studio Display's USB HID interfaces.
+
+    On kernels without vendor/product sysfs attributes we match the hid device
+    instance name (e.g. "0003:05AC:1114.000B"), which encodes bus/vendor/product.
+    """
+    nodes = []
+    for hdir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        device = os.path.realpath(os.path.join(hdir, "device"))
+        inst = os.path.basename(device)  # e.g. 0003:05AC:1114.000B
+        parts = inst.split(":")
+        if len(parts) < 3:
+            continue
+        try:
+            vendor = int(parts[1], 16)
+            product = int(parts[2].split(".")[0], 16)
+        except ValueError:
+            continue
+        if vendor == VENDOR and product in PRODUCTS:
+            nodes.append("/dev/" + os.path.basename(hdir))
+    return nodes
+
+
+def _feature_call(fd, buf, request):
+    data = bytearray(buf)
+    try:
+        n = fcntl.ioctl(fd, request, data)
+    except OSError as e:
+        raise DisplayError(f"ioctl failed: {e}") from e
+    return n, bytes(data)
+
+
+def read_raw(path):
+    fd = os.open(path, os.O_RDWR)
+    try:
+        n, data = _feature_call(fd, [1, 0, 0, 0, 0, 0, 0], HIDIOCGFEATURE)
+        if n != REPORT_LEN:
+            raise DisplayError(f"unexpected report size {n}")
+        return struct.unpack_from("<I", data, 1)[0]
+    finally:
+        os.close(fd)
+
+
+def write_raw(path, value):
+    value = max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, int(value)))
+    fd = os.open(path, os.O_RDWR)
+    try:
+        buf = [1] + list(struct.pack("<I", value)) + [0, 0]
+        _feature_call(fd, buf, HIDIOCSFEATURE)
+    finally:
+        os.close(fd)
+
+
+def pick_working(explicit=None):
+    """Return (hidraw_path, current_raw) for the first interface that answers."""
+    candidates = [explicit] if explicit else find_hidraw_nodes()
+    if not candidates:
+        raise DisplayError(
+            "no Apple Studio Display USB HID interface found "
+            "(is the display connected over USB/Thunderbolt?)")
+    last = None
+    for path in candidates:
+        try:
+            return path, read_raw(path)
+        except DisplayError as e:
+            last = e
+            continue
+    raise DisplayError(
+        f"none of {candidates} accepted the brightness feature report "
+        f"({last}); check /dev/hidraw permissions (udev rule?)")
+
+
+def to_percent(raw):
+    v = (raw - MIN_BRIGHTNESS) / (MAX_BRIGHTNESS - MIN_BRIGHTNESS)
+    return max(0, min(100, round(v * 100)))
+
+
+def to_raw(percent):
+    v = int(round(float(percent) / 100 * (MAX_BRIGHTNESS - MIN_BRIGHTNESS)))
+    return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, v + MIN_BRIGHTNESS))
+
+
+def find_als_iio():
+    """Ambient light sensor of the display, as exposed by the kernel's
+    hid-sensor-als driver (the display's ALS is a HID sensor over USB)."""
+    import glob
+    import os
+    for d in sorted(glob.glob("/sys/bus/iio/devices/iio:device*")):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                name = f.read().strip().lower()
+            dev = os.path.realpath(os.path.join(d, "device"))
+        except OSError:
+            continue
+        if "als" in name and "05ac:1114" in dev.lower():
+            return d
+    return None
+
+
+def read_als():
+    d = find_als_iio()
+    if not d:
+        raise DisplayError("no ambient light sensor (hid-sensor-als) found")
+    try:
+        raw = int(_read_attr(os.path.join(d, "in_illuminance_raw")))
+        scale = float(_read_attr(os.path.join(d, "in_illuminance_scale")))
+    except (OSError, ValueError) as e:
+        raise DisplayError(f"cannot read ALS at {d}: {e}")
+    # sysfs ABI: lux = raw * scale
+    return raw, scale, raw * scale
+
+
+def main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="studio-brightness")
+    ap.add_argument("command", choices=["get", "set", "set-percent", "probe", "als"])
+    ap.add_argument("value", nargs="?", type=float)
+    ap.add_argument("--hidraw", default=None, help="explicit /dev/hidrawN node")
+    args = ap.parse_args(argv)
+
+    if args.command == "probe":
+        nodes = find_hidraw_nodes()
+        if not nodes:
+            print("no 05ac Studio Display hidraw interfaces", file=sys.stderr)
+            return 1
+        for n in nodes:
+            try:
+                print(f"{n}: OK raw={read_raw(n)}")
+            except DisplayError as e:
+                print(f"{n}: FAIL {e}")
+        return 0
+
+    if args.command == "als":
+        raw, scale, lux = read_als()
+        print(f"raw={raw} scale={scale} lux={lux:.1f}")
+        return 0
+
+    path, raw = pick_working(args.hidraw)
+
+    if args.command == "get":
+        print(f"hidraw={path} raw={raw} percent={to_percent(raw)} "
+              f"min={MIN_BRIGHTNESS} max={MAX_BRIGHTNESS}")
+        return 0
+    if args.command == "set":
+        if args.value is None:
+            ap.error("set needs a raw value")
+        write_raw(path, args.value)
+    elif args.command == "set-percent":
+        if args.value is None:
+            ap.error("set-percent needs a percentage")
+        write_raw(path, to_raw(args.value))
+    print(f"ok hidraw={path}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except DisplayError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
