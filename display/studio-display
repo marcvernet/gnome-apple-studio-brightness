@@ -6,13 +6,14 @@
 # nominal — 59.94 Hz / 935.060 MHz, same link load — is flawless. A custom
 # EDID (built by build_ladder.py) advertises 5K at 50/54/56/58/59.94 Hz;
 # GNOME remembers the chosen mode in monitors.xml. Forced DSC adds real
-# 8-bit color (bpp 24, no FRC dithering) at ~40% link load, and is only
+# bit depth (bpp 24-36, no FRC dithering) at ~40% link load, and is only
 # safe on the sub-60 timings — this script enforces that.
 #
 # Usage:
 #   studio-display status          what is running: mode, refresh, DSC, bpp, dither, link
-#   studio-display dsc on|off      force-enable/disable DSC (+ link retrain); --force to bypass guard
-#   studio-display install         persist EDID via drm.edid_firmware + auto-arm DSC at boot/replug
+#   studio-display dsc on|off      force DSC on/off — remembered; a timer re-converges
+#                                  after mutter modesets (login/resume); --force bypasses guard
+#   studio-display install         persist EDID via drm.edid_firmware + DSC convergence timer
 #   studio-display uninstall       reverse install
 set -u
 
@@ -23,7 +24,11 @@ FW_PATH="/lib/firmware/edid/$EDID_NAME"
 # MUST be connector-scoped ("DP-2:...") or eDP would get this EDID too
 PARAM="drm.edid_firmware=${CONNECTOR}:${FWREF}"
 UNIT="apple-studio-display-dsc.service"
+TIMER="apple-studio-display-dsc.timer"
 RULE="99-apple-studio-display.rules"
+STATE_DIR="/var/lib/studio-display"
+MARKER="$STATE_DIR/dsc"          # desired DSC state: "on" (default) or "off"
+LOCK="/run/lock/studio-display.lock"
 DSC_MAX_KHZ=935500        # above this = exact-60 timing where forced DSC blacks the panel
 BINDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
@@ -105,7 +110,8 @@ cmd_status() {
 
     dsc=$(sed -n 's/^DSC_Enabled: //p' "$DBG/i915_dsc_fec_support" 2>/dev/null)
     force=$(sed -n 's/^Force_DSC_Enable: //p' "$DBG/i915_dsc_fec_support" 2>/dev/null)
-    printf 'DSC         : %s (force flag: %s)\n' "$(yn "${dsc:-no}")" "$(yn "${force:-no}")"
+    printf 'DSC         : %s (force flag: %s, desired: %s)\n' \
+        "$(yn "${dsc:-no}")" "$(yn "${force:-no}")" "$(marker_get)"
 
     link=$(link_state); set -- $link; pc=${1:-}; lc=${2:-}
     case "${pc:-x}" in
@@ -133,11 +139,16 @@ cmd_status() {
     else
         echo "  ✓  tear-free timing (clock ≤ ${DSC_MAX_KHZ} kHz)"
     fi
-    if [ "$bpp" = "24" ] && [ "$dither" = "no" ] && [ "${dsc:-no}" = "yes" ]; then
-        echo "  ✓  true 8-bit via DSC — no FRC dithering"
+    if [ "${dsc:-no}" = yes ] && [ "$dither" = no ] && [ "${bpp:-0}" -ge 24 ] 2>/dev/null; then
+        echo "  ✓  full bit depth via DSC (bpp $bpp) — no FRC dithering"
     elif [ "$bpp" = "18" ]; then
         echo "  ○  6-bit + FRC dithering (tear-free but banded gradients)."
-        echo "     For 8-bit:  sudo studio-display dsc on"
+        if [ "$(marker_get)" = on ]; then
+            echo "     should self-heal within ~2 min (reconcile timer);"
+            echo "     right now:  sudo studio-display dsc on"
+        else
+            echo "     re-enable:  sudo studio-display dsc on"
+        fi
     fi
     if [ -z "$fw" ] && [ ! -f "$FW_PATH" ]; then
         echo "  ○  setup not persistent — sudo studio-display install"
@@ -146,43 +157,24 @@ cmd_status() {
 }
 
 # ---- dsc -------------------------------------------------------------------
-wait_for_5k() {  # auto-arm paths: give mutter time to commit a mode after HPD
-    local i
-    for i in $(seq 1 30); do
-        [ -n "$(active_5k)" ] && return 0
-        sleep 1
-    done
-    return 1
+marker_get() { cat "$MARKER" 2>/dev/null || echo "on"; }   # default: on
+marker_set() { mkdir -p "$STATE_DIR"; printf '%s' "$1" > "$MARKER"; }
+
+dsc_field() {  # $1 = DSC_Enabled | Force_DSC_Enable
+    sed -n "s/^$1: //p" "$DBG/i915_dsc_fec_support" 2>/dev/null
+}
+dsc_fully_on() {
+    [ "$(dsc_field DSC_Enabled)" = yes ] && [ "$(dsc_field Force_DSC_Enable)" = yes ]
 }
 
-cmd_dsc() {  # $1=on|off [$2=--quiet] [$3=--force]
-    local mode="$1" quiet="${2:-}" force="${3:-}" a clock reason rc
-    case "$mode" in on|off) ;; *) die "dsc takes 'on' or 'off'" ;; esac
-    need_root dsc "$mode" ${quiet:+$quiet} ${force:+$force}
-
-    if [ -n "$quiet" ]; then
-        wait_for_5k || exit 0        # display not (yet) in 5K — nothing to arm
-        # idempotent: don't churn the link when already armed
-        if [ "$mode" = on ] &&
-           [ "$(sed -n 's/^DSC_Enabled: //p' "$DBG/i915_dsc_fec_support")" = yes ] &&
-           [ "$(sed -n 's/^Force_DSC_Enable: //p' "$DBG/i915_dsc_fec_support")" = yes ]; then
-            exit 0
-        fi
-    fi
-
-    if [ "$mode" = on ] && [ "$force" != --force ]; then
-        rc=0; reason=$(dsc_guard) || rc=$?
-        if [ $rc -ne 0 ]; then
-            [ -n "$quiet" ] && exit 0        # auto-arm never forces an unsafe state
-            die "$reason"
-        fi
-    fi
-
-    echo "$([ "$mode" = on ] && echo 1 || echo 0)" > "$DBG/i915_dsc_fec_support"
-    echo 1 > "$DBG/i915_dp_force_link_retrain"   # retrain: where DSC force actually applies
-    sleep 3
-    [ -n "$quiet" ] && return 0
-    cmd_status
+write_dsc() {  # $1 = 1|0 — write force flag + link retrain (retrain is what applies it)
+    mkdir -p /run/lock
+    (
+        flock 9
+        echo "$1" > "$DBG/i915_dsc_fec_support" &&
+            echo 1 > "$DBG/i915_dp_force_link_retrain"
+        sleep 3
+    ) 9>"$LOCK"
 }
 
 dsc_guard() {  # 0 = safe to force DSC; else prints reason
@@ -196,6 +188,58 @@ dsc_guard() {  # 0 = safe to force DSC; else prints reason
         return 1
     fi
     return 0
+}
+
+cmd_dsc() {  # $1=on|off [$2=--force] — manual toggle; records desired state
+    local mode="$1" force="${2:-}" reason rc
+    case "$mode" in on|off) ;; *) die "dsc takes 'on' or 'off'" ;; esac
+    need_root dsc "$mode" ${force:+$force}
+
+    if [ "$mode" = on ] && [ "$force" != --force ]; then
+        rc=0; reason=$(dsc_guard) || rc=$?
+        [ $rc -ne 0 ] && die "$reason"
+    fi
+    marker_set "$mode"
+    write_dsc "$([ "$mode" = on ] && echo 1 || echo 0)"
+    cmd_status
+}
+
+# Converge hardware to the desired state (marker). Runs from the boot/recurring
+# systemd timer and the hotplug udev rule — mutter clears the force flag on
+# every modeset (login, resume, replug), so we re-check instead of trusting one
+# arming moment. Never touches the link when already converged; never arms on
+# unsafe (exact-60) timings.
+cmd_reconcile() {  # [--quiet] [--bg]
+    local quiet="" bg="" a
+    for a in "$@"; do
+        case "$a" in
+            --quiet) quiet=--quiet ;;
+            --bg)    bg=1 ;;
+            *) die "unknown reconcile option '$a'" ;;
+        esac
+    done
+    need_root reconcile ${quiet:+$quiet} ${bg:+$bg}
+    # udev RUN= must return fast: detach the worker (already root here)
+    [ -n "$bg" ] && { setsid "$0" reconcile --quiet >/dev/null 2>&1 & exit 0; }
+
+    case "$(marker_get)" in
+        on)
+            dsc_guard || exit 0                  # no 5K yet / 60 Hz: nothing safe to do
+            dsc_fully_on && exit 0
+            write_dsc 1
+            if [ "$(dsc_field DSC_Enabled)" = yes ]; then
+                logger -t studio-display "DSC armed (reconcile)"
+            else
+                logger -t studio-display "DSC arm did not take (reconcile)"
+            fi
+            ;;
+        off)
+            [ "$(dsc_field Force_DSC_Enable)" = yes ] || exit 0
+            write_dsc 0
+            logger -t studio-display "DSC disarmed (reconcile)"
+            ;;
+    esac
+    exit 0
 }
 
 # ---- install / uninstall ---------------------------------------------------
@@ -217,27 +261,51 @@ cmd_install() {
 
     # self-install the CLI when run from a repo checkout
     [ "$BINDIR" != "/usr/local/bin" ] && install -m0755 "$(readlink -f "$0")" /usr/local/bin/studio-display
+    chmod 0755 /usr/local/bin/studio-display 2>/dev/null || true   # systemd EXEC needs +x
 
+    # desired state (default on); survives reinstalls
+    mkdir -p "$STATE_DIR"; [ -f "$MARKER" ] || printf 'on' > "$MARKER"
+
+    # mutter clears the DSC force flag on every modeset (login, resume), and a
+    # cold-plugged panel fires no hotplug event — so instead of trusting one
+    # arming moment, a timer re-converges hardware to $MARKER indefinitely.
     cat > "/etc/systemd/system/$UNIT" <<EOF
 [Unit]
-Description=Arm DSC (8-bit) on the Apple Studio Display 5K tear-free mode
-After=graphical.target
-Wants=graphical.target
+Description=Converge Apple Studio Display DSC to desired state
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/studio-display dsc on --quiet --bg
+ExecStart=/usr/local/bin/studio-display reconcile --quiet
+EOF
+    cat > "/etc/systemd/system/$TIMER" <<EOF
+[Unit]
+Description=Apple Studio Display DSC convergence check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+AccuracySec=15s
 
 [Install]
-WantedBy=graphical.target
+WantedBy=timers.target
 EOF
     cat > "/etc/udev/rules.d/$RULE" <<EOF
-# Re-arm DSC (8-bit) when the Studio Display is (re)plugged. --bg detaches.
-SUBSYSTEM=="drm", KERNEL=="card*-$CONNECTOR", ACTION=="change", RUN+="/usr/local/bin/studio-display dsc on --quiet --bg"
+# Re-converge DSC when the Studio Display is (re)plugged. --bg detaches.
+SUBSYSTEM=="drm", KERNEL=="card*-$CONNECTOR", ACTION=="change", RUN+="/usr/local/bin/studio-display reconcile --quiet --bg"
 EOF
+    systemctl disable "$UNIT" >/dev/null 2>&1 || true   # drop legacy graphical.target enable
     systemctl daemon-reload
-    systemctl enable --now "$UNIT" >/dev/null 2>&1
+    systemctl enable --now "$TIMER" >/dev/null 2>&1
     udevadm control --reload-rules
+
+    # EDID inside initramfs: i915 probes connectors from the initrd, where
+    # /lib/firmware/edid doesn't exist -> early "*ERROR* Requesting EDID
+    # firmware failed" (harmless: userspace probes reload it in real root,
+    # but this makes it deterministic and silent from t=0).
+    if command -v dracut >/dev/null 2>&1 && ! grep -qs "$EDID_NAME" /etc/dracut.conf.d/*edid*.conf; then
+        printf 'install_items+=" %s "\n' "$FW_PATH" > /etc/dracut.conf.d/apple-studio-display-edid.conf
+        dracut -f >/dev/null 2>&1 || true
+    fi
 
     if command -v grubby >/dev/null 2>&1; then
         grubby --update-kernel=ALL --remove-args="drm.edid_firmware"   # clear stale values
@@ -254,7 +322,8 @@ EOF
     echo "Installed:"
     echo "  EDID      : $FW_PATH (5K @ 50/54/56/58/59.94 Hz; stock 60 Hz kept)"
     echo "  boot param: $PARAM  (applies next boot; active now at runtime)"
-    echo "  DSC arming: $UNIT at login + udev rule on replug"
+    echo "  DSC arming: $TIMER (boot + every 2 min) + udev rule on replug"
+    echo "              desired state in $MARKER — 'sudo studio-display dsc off' keeps it off"
     echo "GNOME keeps 59.94 Hz via ~/.config/monitors.xml. Verify after a reboot with:"
     echo "  studio-display status"
 }
@@ -268,11 +337,18 @@ cmd_uninstall() {
     printf ',' > /sys/module/drm/parameters/edid_firmware 2>/dev/null || true
     command -v grubby >/dev/null 2>&1 && grubby --update-kernel=ALL --remove-args="drm.edid_firmware"
     sed -i "s| drm\.edid_firmware=[^ \"]*||g" /etc/default/grub 2>/dev/null || true
+    systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
     systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$UNIT" "/etc/udev/rules.d/$RULE"
+    rm -f "/etc/systemd/system/$UNIT" "/etc/systemd/system/$TIMER" "/etc/udev/rules.d/$RULE"
+    rm -rf "$STATE_DIR"
+    if command -v dracut >/dev/null 2>&1 && ls /etc/dracut.conf.d/*apple-studio-display* >/dev/null 2>&1; then
+        rm -f /etc/dracut.conf.d/*apple-studio-display*.conf
+        dracut -f >/dev/null 2>&1 || true
+    fi
     systemctl daemon-reload; udevadm control --reload-rules
-    echo "Removed kernel param, unit, udev rule. Stock EDID returns on next detect"
-    echo "(replug or reboot). Optional cleanup: sudo rm -f $FW_PATH /usr/local/bin/studio-display"
+    echo "Removed kernel param, timer, udev rule, desired-state marker. Stock EDID"
+    echo "returns on next detect (replug or reboot). Optional cleanup:"
+    echo "  sudo rm -f $FW_PATH /usr/local/bin/studio-display"
 }
 
 # ---- dispatch ---------------------------------------------------------------
@@ -282,22 +358,20 @@ case "${1:-help}" in
     status) cmd_status ;;
     dsc)
         shift
-        mode=""; quiet=""; force=""; bg=0
+        mode=""; force=""
         for a in "$@"; do
             case "$a" in
                 on|off)   mode="$a" ;;
-                --quiet)  quiet=--quiet ;;
                 --force)  force=--force ;;
-                --bg)     bg=1 ;;
+                --quiet|--bg) ;;   # legacy no-ops: auto paths use 'reconcile' now
                 *) die "unknown dsc option '$a'" ;;
             esac
         done
-        mode="${mode:-on}"
-        if [ "$bg" = 1 ]; then
-            setsid "$0" dsc "$mode" $quiet $force >/dev/null 2>&1 &
-            exit 0
-        fi
-        cmd_dsc "$mode" "$quiet" "$force"
+        cmd_dsc "${mode:-on}" "$force"
+        ;;
+    reconcile)
+        shift
+        cmd_reconcile "$@"
         ;;
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;

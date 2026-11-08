@@ -24,16 +24,24 @@ so GNOME has no clean mode to pick.
    GNOME then offers 59.94 Hz in Settings → Displays; the choice is kept in
    `~/.config/monitors.xml` and survives replug/reboot.
 2. **Forced DSC** (`i915_dsc_fec_support` + link retrain): the DP link runs
-   Display Stream Compression, giving **true 8-bit output with no FRC
-   dithering** (`bpp=24, dither=no`) at ~40 % link load. Safe on all
-   sub-60 timings; at exactly 60 Hz it blacks the panel, so the tool
-   refuses to arm DSC there.
+   Display Stream Compression, giving **full bit depth with no FRC
+   dithering** (`dither=no`, bpp 24–36 depending on the negotiated depth) at
+   ~40 % link load. Safe on all sub-60 timings; at exactly 60 Hz it blacks
+   the panel, so the tool refuses to arm DSC there.
 3. **Persistence**: the EDID lives in `/lib/firmware/edid/` and is applied on
    every boot/hotplug via the kernel cmdline
    `drm.edid_firmware=DP-2:edid/apple-studio-display-5k-ladder.bin`. The
    `DP-2:` prefix is **required** — an unprefixed value would override *every*
-   connector including the laptop's eDP panel. DSC is re-armed after login
-   (systemd oneshot) and after replug (udev rule).
+   connector including the laptop's eDP panel. `install` also drops a dracut
+   config so the EDID is inside the initramfs (i915 probes from the initrd,
+   where `/lib/firmware` is otherwise unavailable).
+4. **DSC convergence**: mutter clears the DSC force flag on *every* modeset
+   (login, resume, replug), and a cold-plugged panel fires no hotplug event,
+   so a single "arm at boot" step always loses the race. Instead the desired
+   state lives in `/var/lib/studio-display/dsc` and a systemd **timer**
+   (boot + every 2 min) plus a hotplug udev rule converge the hardware to it.
+   Already-converged → instant no-op; `dsc off` is therefore **sticky** (it
+   moves the desired state, not just the flag).
 
 ## Use
 
@@ -43,7 +51,7 @@ sudo ./studio-display install      # or: pkexec ./studio-display install
 
 # afterwards, anytime:
 studio-display status              # mode, refresh, clock, DSC, bpp, dither, link, verdict
-studio-display dsc on | off        # toggle 8-bit DSC (manual; auto-armed otherwise)
+studio-display dsc on | off        # desired DSC state (remembered; timer keeps converging)
 sudo studio-display uninstall      # revert everything
 ```
 
@@ -53,13 +61,13 @@ sudo studio-display uninstall      # revert everything
 == Apple Studio Display (card1-DP-2, kernel ...) ==
 Connector   : connected   EDID: firmware /lib/firmware/edid/apple-studio-display-5k-ladder.bin (4 extensions)
 Mode        : 5120x2880 @ 59.94 Hz  (clock 935060 kHz, htot 5200, vtot 3000)
-Pipe        : bpp 24, dither no
-DSC         : on (force flag: on)
+Pipe        : bpp 36, dither no
+DSC         : on (force flag: on, desired: on)
 Link        : HBR2 x4 (SST)        # "standby (idle)" while the panel sleeps
 EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 -- verdict --
   ✓  tear-free timing (clock ≤ 935500 kHz)
-  ✓  true 8-bit via DSC — no FRC dithering
+  ✓  full bit depth via DSC (bpp 36) — no FRC dithering
 ```
 
 ## Files
@@ -69,7 +77,7 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 | `build_ladder.py` | regenerates the EDID from `edid/apple-studio-display-stock.bin` (self-checks against the kernel's DisplayID parser) |
 | `edid/apple-studio-display-stock.bin` | stock EDID dumped from the panel |
 | `edid/apple-studio-display-5k-ladder.bin` | the override actually installed |
-| `studio-display` | CLI: `status`, `dsc`, `install`, `uninstall`; installs its own systemd unit + udev rule |
+| `studio-display` | CLI: `status`, `dsc`, `install`, `uninstall`; installs its own systemd service + timer + udev rule |
 
 ## Notes & safety
 
@@ -77,9 +85,13 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
   observed). The `dsc on` command refuses when the active DP-2 CRTC clock is
   above 935500 kHz; the boot/udev auto-arm silently skips in that case.
 * The force flag is cleared by connector re-detects and mode switches —
-  that is why re-arming must happen *after* the mode commit; the udev rule
-  and unit handle this, `dsc on` (manual) writes the flag then triggers
-  `i915_dp_force_link_retrain` to make it take effect.
+  that is why arming must happen *after* the mode commit. The convergence
+  timer (every 2 min) and the udev rule re-check continuously instead of
+  trusting one arming moment; each pass is a no-op (~30 ms) when hardware
+  already matches the desired state, so the panel is not retrained needlessly.
+* `studio-display dsc off` records the desired state as off, so the timer
+  respects it (and actively disarms a stray `Force_DSC_Enable`). Re-enable
+  with `studio-display dsc on`.
 * `install` also clears any debugfs `edid_override` (writing `reset`) so the
   firmware EDID is the single source of truth.
 * The connector name is configurable: `STUDIO_DISPLAY_CONNECTOR=DP-4
