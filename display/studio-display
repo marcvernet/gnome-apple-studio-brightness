@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# studio-display — manage the Apple Studio Display tear-free 5K mode on Linux.
+#
+# Background: this panel's TCON misbehaves at exactly 60.00 Hz / 936.000 MHz
+# input (scroll tearing uncompressed; no sync with DSC). 1000 ppm under
+# nominal — 59.94 Hz / 935.060 MHz, same link load — is flawless. A custom
+# EDID (built by build_ladder.py) advertises 5K at 50/54/56/58/59.94 Hz;
+# GNOME remembers the chosen mode in monitors.xml. Forced DSC adds real
+# 8-bit color (bpp 24, no FRC dithering) at ~40% link load, and is only
+# safe on the sub-60 timings — this script enforces that.
+#
+# Usage:
+#   studio-display status          what is running: mode, refresh, DSC, bpp, dither, link
+#   studio-display dsc on|off      force-enable/disable DSC (+ link retrain); --force to bypass guard
+#   studio-display install         persist EDID via drm.edid_firmware + auto-arm DSC at boot/replug
+#   studio-display uninstall       reverse install
+set -u
+
+CONNECTOR="${STUDIO_DISPLAY_CONNECTOR:-DP-2}"
+EDID_NAME="apple-studio-display-5k-ladder.bin"
+FWREF="edid/$EDID_NAME"
+FW_PATH="/lib/firmware/edid/$EDID_NAME"
+# MUST be connector-scoped ("DP-2:...") or eDP would get this EDID too
+PARAM="drm.edid_firmware=${CONNECTOR}:${FWREF}"
+UNIT="apple-studio-display-dsc.service"
+RULE="99-apple-studio-display.rules"
+DSC_MAX_KHZ=935500        # above this = exact-60 timing where forced DSC blacks the panel
+BINDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+die() { echo "studio-display: $*" >&2; exit 1; }
+
+# ---- topology -------------------------------------------------------------
+CARD=""
+for d in /sys/class/drm/card*-"$CONNECTOR"; do [ -e "$d" ] && { CARD="${d##*/}"; break; }; done
+[ -n "$CARD" ] || die "connector $CONNECTOR not found under /sys/class/drm (is the display plugged in?)"
+DRMNO="${CARD#card}"; DRMNO="${DRMNO%%-*}"          # card1-DP-2 -> 1
+INFO="/sys/kernel/debug/dri/$DRMNO/i915_display_info"
+DBG="/sys/kernel/debug/dri/$DRMNO/$CONNECTOR"
+SYSD="/sys/class/drm/$CARD"
+
+need_root() {
+    [ "$(id -u)" = 0 ] && return 0
+    command -v pkexec >/dev/null 2>&1 && exec pkexec "$0" "$@"
+    die "this command needs root"
+}
+
+# ---- parsing helpers (i915 debugfs + sysfs) --------------------------------
+# Active 5K CRTC uapi line -> "clock htotal vtotal" (empty if 5K not active)
+active_5k() {
+    [ -r "$INFO" ] || return 0
+    grep 'uapi:' "$INFO" 2>/dev/null | grep -m1 'mode="5120x2880": ' | grep 'active=yes' | awk '
+        { for (i = 1; i <= NF; i++) if ($i ~ /^mode=/) { print $(i+2), $(i+6), $(i+10); exit } }'
+}
+refresh_hz() {  # "clock_kHz htot vtot" -> Hz (2dp)
+    awk '{ printf "%.2f", $1 * 1000 / ($2 * $3) }' <<<"$1"
+}
+pipe_state() {  # -> "dither bpp" for the 5K pipe (order-insensitive)
+    [ -r "$INFO" ] || return 0
+    grep -m1 "src=5120x2880" "$INFO" 2>/dev/null | awk '
+        match($0, /dither=[a-z]+/) { d = substr($0, RSTART+7, RLENGTH-7) }
+        match($0, /bpp=[0-9]+/)    { b = substr($0, RSTART+4, RLENGTH-4) }
+        END { if (d != "" && b != "") print d, b }'
+}
+link_state() {  # DP-2 connector block -> "port_clock lane_count"
+    [ -r "$INFO" ] || return 0
+    awk -v c="$CONNECTOR" '
+        $0 ~ "\\[CONNECTOR:[0-9]+:" c "\\]" { f = 1; next }
+        /^\[CONNECTOR:/ { if (f && pc != "" && lc != "") { print pc, lc; exit } f = 0 }
+        f && match($0, /port_clock=[0-9]+/) { pc = substr($0, RSTART+11, RLENGTH-11) }
+        f && match($0, /lane_count=[0-9]+/) { lc = substr($0, RSTART+11, RLENGTH-11) }
+        END { if (f && pc != "" && lc != "") print pc, lc }' "$INFO"
+}
+yn() { [ "$1" = "yes" ] && echo "on" || echo "off"; }
+
+# ---- status ----------------------------------------------------------------
+cmd_status() {
+    [ -r "$DBG/i915_dsc_fec_support" ] || need_root status
+    echo "== Apple Studio Display (${CARD}, kernel $(uname -r)) =="
+
+    local conn blocks edid
+    conn=$(cat "$SYSD/status" 2>/dev/null || echo "?")
+    blocks=$(od -An -tu1 -j126 -N1 "$SYSD/edid" 2>/dev/null | tr -d ' ')
+    edid="stock"
+    if [ "$(wc -c < "$DBG/edid_override" 2>/dev/null || echo 0)" -gt 0 ]; then
+        edid="debugfs override (volatile)"
+    elif [ -f "$FW_PATH" ]; then
+        edid="firmware $FW_PATH"
+    fi
+    printf 'Connector   : %s   EDID: %s (%s extensions)\n' "$conn" "$edid" "${blocks:-?}"
+
+    local a clock="" refresh="" pipe dither="" bpp="" dsc force link pc lc fw
+    a=$(active_5k)
+    if [ -n "$a" ]; then
+        set -- $a
+        clock=$1
+        refresh=$(refresh_hz "$a")
+        printf 'Mode        : 5120x2880 @ %s Hz  (clock %s kHz, htot %s, vtot %s)\n' \
+            "$refresh" "$1" "$2" "$3"
+    else
+        printf 'Mode        : no active 5K mode on %s\n' "$CONNECTOR"
+    fi
+
+    pipe=$(pipe_state); dither=${pipe% *}; bpp=${pipe#* }
+    [ -n "$pipe" ] && printf 'Pipe        : bpp %s, dither %s\n' "$bpp" "$dither"
+
+    dsc=$(sed -n 's/^DSC_Enabled: //p' "$DBG/i915_dsc_fec_support" 2>/dev/null)
+    force=$(sed -n 's/^Force_DSC_Enable: //p' "$DBG/i915_dsc_fec_support" 2>/dev/null)
+    printf 'DSC         : %s (force flag: %s)\n' "$(yn "${dsc:-no}")" "$(yn "${force:-no}")"
+
+    link=$(link_state); set -- $link; pc=${1:-}; lc=${2:-}
+    case "${pc:-x}" in
+        540000) pc=HBR2 ;; 810000) pc=HBR3 ;; 270000) pc=HBR ;; 162000) pc=RBR ;;
+        0) [ -n "$clock" ] && pc="standby (idle)" || pc=down ;;
+        *) pc="${pc:-?}" ;;
+    esac
+    printf 'Link        : %s x%s (SST)\n' "${pc:-?}" "${lc:-?}"
+
+    fw=$(cat /sys/module/drm/parameters/edid_firmware 2>/dev/null)
+    [ "$fw" = "(null)" ] && fw=""
+    if [ -n "$fw" ]; then
+        local psrc="(runtime only)"
+        grep -q "$PARAM" /proc/cmdline 2>/dev/null && psrc="(kernel cmdline, persistent)"
+        printf 'EDID param  : drm.edid_firmware=%s %s\n' "$fw" "$psrc"
+    fi
+
+    echo "-- verdict --"
+    if [ -z "$clock" ]; then
+        echo "  ⚠  5K not active"
+    elif [ "$clock" -gt "$DSC_MAX_KHZ" ]; then
+        echo "  ⚠  exact-60 Hz timing — known to tear on this panel."
+        echo "     Fix: Settings → Displays → Studio Display → 5120 x 2880 (59.94 Hz),"
+        echo "     or:  sudo studio-display dsc off   (then re-check)"
+    else
+        echo "  ✓  tear-free timing (clock ≤ ${DSC_MAX_KHZ} kHz)"
+    fi
+    if [ "$bpp" = "24" ] && [ "$dither" = "no" ] && [ "${dsc:-no}" = "yes" ]; then
+        echo "  ✓  true 8-bit via DSC — no FRC dithering"
+    elif [ "$bpp" = "18" ]; then
+        echo "  ○  6-bit + FRC dithering (tear-free but banded gradients)."
+        echo "     For 8-bit:  sudo studio-display dsc on"
+    fi
+    if [ -z "$fw" ] && [ ! -f "$FW_PATH" ]; then
+        echo "  ○  setup not persistent — sudo studio-display install"
+    fi
+    return 0
+}
+
+# ---- dsc -------------------------------------------------------------------
+wait_for_5k() {  # auto-arm paths: give mutter time to commit a mode after HPD
+    local i
+    for i in $(seq 1 30); do
+        [ -n "$(active_5k)" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+cmd_dsc() {  # $1=on|off [$2=--quiet] [$3=--force]
+    local mode="$1" quiet="${2:-}" force="${3:-}" a clock reason rc
+    case "$mode" in on|off) ;; *) die "dsc takes 'on' or 'off'" ;; esac
+    need_root dsc "$mode" ${quiet:+$quiet} ${force:+$force}
+
+    if [ -n "$quiet" ]; then
+        wait_for_5k || exit 0        # display not (yet) in 5K — nothing to arm
+        # idempotent: don't churn the link when already armed
+        if [ "$mode" = on ] &&
+           [ "$(sed -n 's/^DSC_Enabled: //p' "$DBG/i915_dsc_fec_support")" = yes ] &&
+           [ "$(sed -n 's/^Force_DSC_Enable: //p' "$DBG/i915_dsc_fec_support")" = yes ]; then
+            exit 0
+        fi
+    fi
+
+    if [ "$mode" = on ] && [ "$force" != --force ]; then
+        rc=0; reason=$(dsc_guard) || rc=$?
+        if [ $rc -ne 0 ]; then
+            [ -n "$quiet" ] && exit 0        # auto-arm never forces an unsafe state
+            die "$reason"
+        fi
+    fi
+
+    echo "$([ "$mode" = on ] && echo 1 || echo 0)" > "$DBG/i915_dsc_fec_support"
+    echo 1 > "$DBG/i915_dp_force_link_retrain"   # retrain: where DSC force actually applies
+    sleep 3
+    [ -n "$quiet" ] && return 0
+    cmd_status
+}
+
+dsc_guard() {  # 0 = safe to force DSC; else prints reason
+    local a clock
+    a=$(active_5k)
+    [ -n "$a" ] || { echo "no active 5K mode on $CONNECTOR"; return 1; }
+    clock=${a%% *}
+    if [ "$clock" -gt "$DSC_MAX_KHZ" ]; then
+        echo "active mode is ${clock} kHz (exact-60 timing): forced DSC blacks this panel."
+        echo "Switch to 59.94 Hz in Settings first, or pass --force."
+        return 1
+    fi
+    return 0
+}
+
+# ---- install / uninstall ---------------------------------------------------
+grub_file_ensure() {  # so future kernel installs inherit the param
+    local f=/etc/default/grub v
+    # drop any stale/legacy (unscoped) token, then append the correct one
+    sed -i "s| drm\.edid_firmware=[^ \"]*||g" "$f"
+    v=$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/p' "$f" 2>/dev/null)
+    sed -i "s|^GRUB_CMDLINE_LINUX=\"[^\"]*\"|GRUB_CMDLINE_LINUX=\"$v $PARAM\"|" "$f"
+}
+
+cmd_install() {
+    need_root install
+    [ -f "$FW_PATH" ] || [ -f "$BINDIR/edid/$EDID_NAME" ] || \
+        die "EDID not found ($BINDIR/edid/$EDID_NAME). Run install from the repo's display/ directory."
+    install -d -m0755 /lib/firmware/edid
+    [ -f "$BINDIR/edid/$EDID_NAME" ] && install -m0644 "$BINDIR/edid/$EDID_NAME" "$FW_PATH"
+    [ -f "$FW_PATH" ] || die "failed to install EDID to $FW_PATH"
+
+    # self-install the CLI when run from a repo checkout
+    [ "$BINDIR" != "/usr/local/bin" ] && install -m0755 "$(readlink -f "$0")" /usr/local/bin/studio-display
+
+    cat > "/etc/systemd/system/$UNIT" <<EOF
+[Unit]
+Description=Arm DSC (8-bit) on the Apple Studio Display 5K tear-free mode
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/studio-display dsc on --quiet --bg
+
+[Install]
+WantedBy=graphical.target
+EOF
+    cat > "/etc/udev/rules.d/$RULE" <<EOF
+# Re-arm DSC (8-bit) when the Studio Display is (re)plugged. --bg detaches.
+SUBSYSTEM=="drm", KERNEL=="card*-$CONNECTOR", ACTION=="change", RUN+="/usr/local/bin/studio-display dsc on --quiet --bg"
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$UNIT" >/dev/null 2>&1
+    udevadm control --reload-rules
+
+    if command -v grubby >/dev/null 2>&1; then
+        grubby --update-kernel=ALL --remove-args="drm.edid_firmware"   # clear stale values
+        grubby --update-kernel=ALL --args="$PARAM"
+    fi
+    grub_file_ensure
+    # live until reboot: firmware EDID for hotplug detects; drop debugfs override
+    if [ -w /sys/module/drm/parameters/edid_firmware ]; then
+        printf '%s' "${CONNECTOR}:${FWREF}" > /sys/module/drm/parameters/edid_firmware 2>/dev/null || true
+    fi
+    # exact 5-byte "reset" clears the override (drm debugfs edid_write handler)
+    printf 'reset' > "$DBG/edid_override" 2>/dev/null || true
+
+    echo "Installed:"
+    echo "  EDID      : $FW_PATH (5K @ 50/54/56/58/59.94 Hz; stock 60 Hz kept)"
+    echo "  boot param: $PARAM  (applies next boot; active now at runtime)"
+    echo "  DSC arming: $UNIT at login + udev rule on replug"
+    echo "GNOME keeps 59.94 Hz via ~/.config/monitors.xml. Verify after a reboot with:"
+    echo "  studio-display status"
+}
+
+cmd_uninstall() {
+    need_root uninstall
+    echo 0 > "$DBG/i915_dsc_fec_support" 2>/dev/null || true
+    echo 1 > "$DBG/i915_dp_force_link_retrain" 2>/dev/null || true
+    printf 'reset' > "$DBG/edid_override" 2>/dev/null || true
+    # "," parses to an empty connector list -> firmware EDID cleanly disabled
+    printf ',' > /sys/module/drm/parameters/edid_firmware 2>/dev/null || true
+    command -v grubby >/dev/null 2>&1 && grubby --update-kernel=ALL --remove-args="drm.edid_firmware"
+    sed -i "s| drm\.edid_firmware=[^ \"]*||g" /etc/default/grub 2>/dev/null || true
+    systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$UNIT" "/etc/udev/rules.d/$RULE"
+    systemctl daemon-reload; udevadm control --reload-rules
+    echo "Removed kernel param, unit, udev rule. Stock EDID returns on next detect"
+    echo "(replug or reboot). Optional cleanup: sudo rm -f $FW_PATH /usr/local/bin/studio-display"
+}
+
+# ---- dispatch ---------------------------------------------------------------
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-help}" in
+    status) cmd_status ;;
+    dsc)
+        shift
+        mode=""; quiet=""; force=""; bg=0
+        for a in "$@"; do
+            case "$a" in
+                on|off)   mode="$a" ;;
+                --quiet)  quiet=--quiet ;;
+                --force)  force=--force ;;
+                --bg)     bg=1 ;;
+                *) die "unknown dsc option '$a'" ;;
+            esac
+        done
+        mode="${mode:-on}"
+        if [ "$bg" = 1 ]; then
+            setsid "$0" dsc "$mode" $quiet $force >/dev/null 2>&1 &
+            exit 0
+        fi
+        cmd_dsc "$mode" "$quiet" "$force"
+        ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 1 ;;
+esac

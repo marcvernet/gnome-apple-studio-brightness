@@ -186,3 +186,18 @@ GNOME only discovers new extension directories at session start.)
 ```
 
 then log out and back in.
+
+## Tear-free 5K display mode
+
+Scroll tearing at 5120x2880@60? This panel's TCON fails only at its exact
+nominal 936.000 MHz pixel clock — the same timing at 935.060 MHz (59.94 Hz)
+is flawless. The [`display/`](display/README.md) directory ships the fix: an
+EDID ladder advertising 5K at 50–59.94 Hz (persisted via
+`drm.edid_firmware`), forced DSC for true 8-bit output, auto-arming after
+login/replug, and a `studio-display` CLI (`status`, `dsc on|off`, `install`,
+`uninstall`).
+
+```sh
+cd display && sudo ./studio-display install
+studio-display status
+```
