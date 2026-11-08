@@ -14,15 +14,22 @@ small to explain this — the failure is specific to the **exact nominal
 clock**, a TCON-side issue (macOS never exercises the plain-60 path: over the
 Thunderbolt tunnel it always runs DSC, which this panel cannot sync at 60 Hz
 on Linux). Note the panel's own EDID advertises 5K@60 as its only 5K timing,
-so GNOME has no clean mode to pick.
+so GNOME has no clean mode to pick — and *why removal, not avoidance,
+matters*: mutter keys `monitors.xml` per output-set, so a fresh arrangement
+("External only") has no saved rate and falls back to the **preferred**
+mode; if stock 60.00 Hz were still advertised it would land exactly there
+(with DSC latched: black screen). It is therefore deleted from the EDID.
 
 ## Solution
 
 1. **EDID ladder** (`edid/apple-studio-display-5k-ladder.bin`): the stock
-   EDID plus one appended DisplayID block advertising 5120x2880 at
-   **50/54/56/58/59.94 Hz** (same native porches: htot 5200, vtot 3000).
-   GNOME then offers 59.94 Hz in Settings → Displays; the choice is kept in
-   `~/.config/monitors.xml` and survives replug/reboot.
+   EDID with its 5120x2880@60.00 DisplayID timing **rewritten to 59.94 Hz
+   (preferred flag kept)** plus one appended DisplayID block advertising
+   5120x2880 at **58/56/54/50 Hz** (same native porches: htot 5200, vtot
+   3000). 60.00 Hz appears nowhere and cannot be selected; 59.94 Hz is
+   now the *preferred* 5K mode, so even mutter's no-config fallback lands
+   on a clean timing. The choice is kept in `~/.config/monitors.xml`
+   (per output-set) and survives replug/reboot.
 2. **Forced DSC** (`i915_dsc_fec_support` + link retrain): the DP link runs
    Display Stream Compression, giving **full bit depth with no FRC
    dithering** (`dither=no`, bpp 24–36 depending on the negotiated depth) at
@@ -74,7 +81,7 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 
 | file | role |
 | ---- | ---- |
-| `build_ladder.py` | regenerates the EDID from `edid/apple-studio-display-stock.bin` (self-checks against the kernel's DisplayID parser) |
+| `build_ladder.py` | regenerates the EDID from `edid/apple-studio-display-stock.bin`: rewrites the stock 60.00 Hz 5K timing to 59.94 Hz and appends the sub-60 ladder (self-checks against the kernel's DisplayID parser; aborts if the 936000 kHz timing survives anywhere) |
 | `edid/apple-studio-display-stock.bin` | stock EDID dumped from the panel |
 | `edid/apple-studio-display-5k-ladder.bin` | the override actually installed |
 | `studio-display` | CLI: `status`, `dsc`, `install`, `uninstall`; installs its own systemd service + timer + udev rule |
@@ -83,7 +90,12 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 
 * **Never force DSC at exactly 60.00 Hz** on this panel (black screen, ×3
   observed). The `dsc on` command refuses when the active DP-2 CRTC clock is
-  above 935500 kHz; the boot/udev auto-arm silently skips in that case.
+  above 935500 kHz; `reconcile` additionally *disarms* a latched DSC on such
+  a timing (restores the picture) and logs why. With the defanged EDID
+  installed this state is unreachable — it is the belt to the suspenders.
+* The kernel (re-)reads the firmware EDID on connector re-detect — after
+  `install` or any EDID file change, replug the cable or reboot to apply it
+  (the initramfs copy is refreshed by `dracut -f` at install time).
 * The force flag is cleared by connector re-detects and mode switches —
   that is why arming must happen *after* the mode commit. The convergence
   timer (every 2 min) and the udev rule re-check continuously instead of

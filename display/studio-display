@@ -4,8 +4,10 @@
 # Background: this panel's TCON misbehaves at exactly 60.00 Hz / 936.000 MHz
 # input (scroll tearing uncompressed; no sync with DSC). 1000 ppm under
 # nominal — 59.94 Hz / 935.060 MHz, same link load — is flawless. A custom
-# EDID (built by build_ladder.py) advertises 5K at 50/54/56/58/59.94 Hz;
-# GNOME remembers the chosen mode in monitors.xml. Forced DSC adds real
+# EDID (built by build_ladder.py) replaces the stock 5K@60.00 timing with
+# 59.94 Hz (preferred) and adds 50/54/56/58 Hz, so the poison timing can
+# never be selected — not even by mutter's preferred-mode fallback when an
+# arrangement (e.g. "External only") has no saved monitors.xml entry. Forced DSC adds real
 # bit depth (bpp 24-36, no FRC dithering) at ~40% link load, and is only
 # safe on the sub-60 timings — this script enforces that.
 #
@@ -29,7 +31,7 @@ RULE="99-apple-studio-display.rules"
 STATE_DIR="/var/lib/studio-display"
 MARKER="$STATE_DIR/dsc"          # desired DSC state: "on" (default) or "off"
 LOCK="/run/lock/studio-display.lock"
-DSC_MAX_KHZ=935500        # above this = exact-60 timing where forced DSC blacks the panel
+DSC_MAX_KHZ="${STUDIO_DISPLAY_DSC_MAX_KHZ:-935500}"  # above = exact-60 poison timing
 BINDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 die() { echo "studio-display: $*" >&2; exit 1; }
@@ -210,7 +212,7 @@ cmd_dsc() {  # $1=on|off [$2=--force] — manual toggle; records desired state
 # arming moment. Never touches the link when already converged; never arms on
 # unsafe (exact-60) timings.
 cmd_reconcile() {  # [--quiet] [--bg]
-    local quiet="" bg="" a
+    local quiet="" bg="" a reason
     for a in "$@"; do
         case "$a" in
             --quiet) quiet=--quiet ;;
@@ -224,7 +226,12 @@ cmd_reconcile() {  # [--quiet] [--bg]
 
     case "$(marker_get)" in
         on)
-            dsc_guard || exit 0                  # no 5K yet / 60 Hz: nothing safe to do
+            reason=$(dsc_guard) || {             # no 5K yet / unsafe (exact-60) timing
+                [ -n "$reason" ] && logger -t studio-display "not arming: $reason"
+                # DSC latched on the poison timing blacks the panel: cut it
+                [ "$(dsc_field DSC_Enabled)" = yes ] && write_dsc 0
+                exit 0
+            }
             dsc_fully_on && exit 0
             write_dsc 1
             if [ "$(dsc_field DSC_Enabled)" = yes ]; then
@@ -320,7 +327,7 @@ EOF
     printf 'reset' > "$DBG/edid_override" 2>/dev/null || true
 
     echo "Installed:"
-    echo "  EDID      : $FW_PATH (5K @ 50/54/56/58/59.94 Hz; stock 60 Hz kept)"
+    echo "  EDID      : $FW_PATH (5K @ 50/54/56/58/59.94 Hz; stock 60.00 Hz removed)"
     echo "  boot param: $PARAM  (applies next boot; active now at runtime)"
     echo "  DSC arming: $TIMER (boot + every 2 min) + udev rule on replug"
     echo "              desired state in $MARKER — 'sudo studio-display dsc off' keeps it off"
@@ -352,7 +359,7 @@ cmd_uninstall() {
 }
 
 # ---- dispatch ---------------------------------------------------------------
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -u/p' "$0" | sed '/^set -u/d; s/^# \{0,1\}//'; }
 
 case "${1:-help}" in
     status) cmd_status ;;

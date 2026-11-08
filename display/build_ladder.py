@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Generate the Apple Studio Display 5K EDID override.
 
-Takes the panel's stock 512-byte EDID and appends one DisplayID (0x70)
-extension block carrying 5120x2880 Type I detailed timings at
-50/54/56/58/59.94 Hz. Rationale: at exactly 60.00 Hz / 936.000 MHz the
-panel's TCON tears (uncompressed) or fails to sync (DSC); 1000 ppm under
-nominal (59.94 Hz) is flawless. See README.md.
+Takes the panel's stock 512-byte EDID, rewrites the stock 5120x2880@60.00
+DisplayID timing to 59.94 Hz (keeping its preferred flag), and appends one
+DisplayID (0x70) extension block with extra 5120x2880 Type I timings at
+50/54/56/58 Hz. Rationale: at exactly 60.00 Hz / 936.000 MHz the panel's
+TCON tears (uncompressed) or fails to sync (DSC); 1000 ppm under nominal
+(59.94 Hz) is flawless — so 60.00 Hz is removed outright and can never be
+picked, e.g. by mutter's "preferred mode" fallback when an arrangement
+like "External only" has no saved monitors.xml rate. See README.md.
 
 Self-check: replicates the kernel's drm_displayid.c parser (4-byte
 displayid header {rev, bytes[3]}, 3-byte data-block header
@@ -23,8 +26,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STOCK = os.path.join(HERE, "edid", "apple-studio-display-stock.bin")
 OUT = os.path.join(HERE, "edid", "apple-studio-display-5k-ladder.bin")
 
-FREQS = [50, 54, 56, 58, 59.94]     # Hz; clock = htot*vtot*f, quantized to 10 kHz
-HTOT, VTOT = 5200, 3000             # panel-native porches (from stock 5K@60 timing)
+FREQS = [50, 54, 56, 58]          # Hz appended as block 4 (59.94 comes from the
+                                  # patched stock 60 Hz entry, see defang_poison)
+HTOT, VTOT = 5200, 3000           # panel-native porches (from stock 5K@60 timing)
+POISON_KHZ = 936000               # exact-60 timing: tears w/o DSC, won't sync w/ DSC
+
+
+def clk_bytes(freq_hz):
+    """Pixel clock as EDID Type I 3-byte field: kHz//10 - 1, little-endian."""
+    n = int(HTOT * VTOT * freq_hz) // 1000 // 10 - 1
+    assert 0 <= n < (1 << 24)
+    return bytes([n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF])
 
 # Type I detailed timing fields 3..19 (flags + 8 u16 "+1" LE fields), copied from
 # the stock 5K@60 timing minus the preferred bit: flags, hact, hblk, hsync, hsw,
@@ -73,19 +85,71 @@ def kernel_parse(ext, label):
     return parse_type1(ext, idx + 3, num // 20)
 
 
+def parse_type1_all(ext, label):
+    """Yield (abs_off, clock_khz, hact, vact) for every Type I timing in a
+    128-byte DisplayID extension, walking data blocks like the kernel does."""
+    assert ext[0] == 0x70, f"{label}: tag {ext[0]:#02x}"
+    dbytes = ext[2] | ext[3] << 8 | ext[4] << 16
+    assert 4 + dbytes + 1 <= 127, f"{label}: structure too long"
+    idx = 5                                        # first data block
+    while idx + 3 <= 5 + dbytes:
+        tag, num = ext[idx], ext[idx + 2]
+        if tag == 0x03:                            # Type I detailed timings
+            assert num % 20 == 0, f"{label}: size {num} not a multiple of 20"
+            for k in range(num // 20):
+                t = ext[idx + 3 + 20*k: idx + 3 + 20*(k+1)]
+                clk = (t[0] | t[1] << 8 | t[2] << 16) + 1
+                u16 = lambda o: t[o] | t[o+1] << 8
+                yield (idx + 3 + 20*k, clk * 10, u16(4) + 1, u16(12) + 1)
+        if tag == 0x00 and num == 0x00:
+            break                                  # zero padding terminates
+        idx += 3 + num
+
+
+def defang_poison(d, keep_hz=59.94):
+    """Rewrite every stock 5120x2880@60.00 Type I entry to 59.94 Hz (preferred
+    flag kept), re-checksumming the blocks touched.
+
+    Why remove (not just avoid) 60 Hz: mutter keys monitors.xml by output set,
+    so a different arrangement (e.g. "External only") has no saved rate and
+    falls back to the preferred mode. If stock 60 Hz is still in the EDID the
+    panel lands on the one timing that tears (or blacks with DSC latched)."""
+    d = bytearray(d)
+    patched = 0
+    for bi in range(1, d[126] + 1):
+        ext = d[128*bi:128*(bi+1)]
+        if ext[0] != 0x70:
+            continue
+        hits = [off for off, clk, h, v in parse_type1_all(ext, f"stock block {bi}")
+                if (clk, h, v) == (POISON_KHZ, 5120, 2880)]
+        if not hits:
+            continue
+        dbytes = ext[2] | ext[3] << 8 | ext[4] << 16
+        csum = 4 + dbytes                          # structure checksum byte
+        for off in hits:
+            d[128*bi + off: 128*bi + off + 3] = clk_bytes(keep_hz)
+            # keep the preferred bit intact: mutter's fallback uses it
+            assert d[128*bi + off + 3] & 0x80, \
+                f"stock block {bi}: patched timing lost preferred flag"
+        d[128*bi + csum] = (-sum(d[128*bi + 1: 128*bi + csum])) & 0xFF
+        d[128*bi + 127] = (-sum(d[128*bi: 128*bi + 127])) & 0xFF
+        patched += len(hits)
+    assert patched == 1, f"expected exactly one stock 5K@60 timing, found {patched}"
+    return bytes(d)
+
+
 def main():
     stock = open(STOCK, "rb").read()
     assert len(stock) == 512, f"stock EDID must be 512 bytes, got {len(stock)}"
     assert stock[126] == 3, f"stock EDID extension count {stock[126]} != 3"
     for i in range(4):
         assert sum(stock[128*i:128*(i+1)]) & 0xFF == 0, f"stock block {i} checksum"
+    stock = defang_poison(stock)
 
     timings = b""
     for f in FREQS:
-        khz = int(HTOT * VTOT * f) // 1000                 # kHz, truncated
-        n = khz // 10 - 1                                  # 10 kHz units, minus 1
-        assert 0 <= n < (1 << 24)
-        clk = bytes([n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF])
+        clk = clk_bytes(f)
+        khz = int(HTOT * VTOT * f) // 1000
         assert (clk[0] | clk[1] << 8 | clk[2] << 16) + 1 == khz // 10
         timings += clk + TAIL
 
@@ -113,10 +177,20 @@ def main():
     for i in range(1, 5):
         assert sum(out[128*i:128*(i+1)]) & 0xFF == 0, f"output block {i} checksum"
 
-    open(OUT, "wb").write(bytes(out))
+    fivek = sorted({clk for bi in range(1, 5) if out[128*bi] == 0x70
+                    for _, clk, h, v in parse_type1_all(out[128*bi:128*(bi+1)],
+                                                         f"block {bi}")
+                    if (h, v) == (5120, 2880)})
+    assert POISON_KHZ not in fivek, "poison 60 Hz timing still present"
+    assert 935060 in fivek, "59.94 Hz (patched stock) timing missing"
+    assert len(fivek) == len(FREQS) + 1, f"unexpected 5K clock set {fivek}"
+
+    open(OUT, "wb").write(out)
     hz = [f"{t['clock_khz']*1000/(HTOT*VTOT):.2f}" for t in got]
-    print(f"wrote {OUT}\n  {len(got)} added 5120x2880 timings: "
-          + ", ".join(hz) + " Hz  (stock 5K@60 unchanged and preferred)")
+    print(f"wrote {OUT}\n  5120x2880 clocks advertised (kHz): "
+          + ", ".join(str(c) for c in fivek)
+          + "\n  stock 5K@60.00 -> 59.94 (preferred); appended: "
+          + ", ".join(hz) + " Hz")
 
 
 if __name__ == "__main__":
