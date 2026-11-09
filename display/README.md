@@ -96,6 +96,12 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 * The kernel (re-)reads the firmware EDID on connector re-detect — after
   `install` or any EDID file change, replug the cable or reboot to apply it
   (the initramfs copy is refreshed by `dracut -f` at install time).
+* DisplayID structure checksums are all-or-nothing: one invalid structure in
+  any extension makes the kernel drop **every** DisplayID timing of the whole
+  EDID (observed: one corrupted checksum byte → `DisplayID checksum invalid,
+  remainder is 149` in dmesg and *zero* 5K modes offered, not even the valid
+  ones). `build_ladder.py` asserts the kernel's checksum rule
+  (`sum(bytes 1..end-of-structure) == 0`) on every emitted block.
 * The force flag is cleared by connector re-detects and mode switches —
   that is why arming must happen *after* the mode commit. The convergence
   timer (every 2 min) and the udev rule re-check continuously instead of

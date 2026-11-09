@@ -91,6 +91,10 @@ def parse_type1_all(ext, label):
     assert ext[0] == 0x70, f"{label}: tag {ext[0]:#02x}"
     dbytes = ext[2] | ext[3] << 8 | ext[4] << 16
     assert 4 + dbytes + 1 <= 127, f"{label}: structure too long"
+    # Structure checksum byte lives at 5 + dbytes (hdr is rev + 3-byte length);
+    # one bad structure checksum makes the kernel drop ALL DisplayID timings of
+    # the whole EDID (observed: 0 5K modes over 5 valid ones), so verify here.
+    assert sum(ext[1: 6 + dbytes]) & 0xFF == 0, f"{label}: displayID checksum"
     idx = 5                                        # first data block
     while idx + 3 <= 5 + dbytes:
         tag, num = ext[idx], ext[idx + 2]
@@ -125,7 +129,7 @@ def defang_poison(d, keep_hz=59.94):
         if not hits:
             continue
         dbytes = ext[2] | ext[3] << 8 | ext[4] << 16
-        csum = 4 + dbytes                          # structure checksum byte
+        csum = 5 + dbytes                          # structure checksum byte
         for off in hits:
             d[128*bi + off: 128*bi + off + 3] = clk_bytes(keep_hz)
             # keep the preferred bit intact: mutter's fallback uses it
