@@ -191,11 +191,11 @@ then log out and back in.
 
 Scroll tearing at 5120x2880@60? This panel's TCON fails only at its exact
 nominal 936.000 MHz pixel clock — the same timing at 935.060 MHz (59.94 Hz)
-is flawless. The [`display/`](display/README.md) directory ships the fix: an
-EDID ladder advertising 5K at 50–59.94 Hz (persisted via
-`drm.edid_firmware`), forced DSC for true 8-bit output, auto-arming after
-login/replug, and a `studio-display` CLI (`status`, `dsc on|off`, `install`,
-`uninstall`).
+is flawless. The [`display/`](display/README.md) directory ships the fix: a
+custom EDID whose *only* 5K timing is 59.94 Hz (the poison 60.00 Hz is
+removed outright, persisted via `drm.edid_firmware`), forced DSC for full
+bit depth with no FRC dithering, auto-arming after boot/replug, and a
+`studio-display` CLI (`status`, `dsc on|off`, `install`, `uninstall`).
 
 ```sh
 cd display && sudo ./studio-display install

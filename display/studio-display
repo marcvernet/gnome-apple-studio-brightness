@@ -4,23 +4,29 @@
 # Background: this panel's TCON misbehaves at exactly 60.00 Hz / 936.000 MHz
 # input (scroll tearing uncompressed; no sync with DSC). 1000 ppm under
 # nominal — 59.94 Hz / 935.060 MHz, same link load — is flawless. A custom
-# EDID (built by build_ladder.py) replaces the stock 5K@60.00 timing with
-# 59.94 Hz (preferred) and adds 50/54/56/58 Hz, so the poison timing can
-# never be selected — not even by mutter's preferred-mode fallback when an
-# arrangement (e.g. "External only") has no saved monitors.xml entry. Forced DSC adds real
-# bit depth (bpp 24-36, no FRC dithering) at ~40% link load, and is only
-# safe on the sub-60 timings — this script enforces that.
+# EDID (built by build_edid.py) rewrites the stock 5K@60.00 timing to
+# 59.94 Hz (preferred) and it is the ONLY 5K timing the EDID advertises, so
+# the poison timing can never be selected — not even by mutter's
+# preferred-mode fallback when an arrangement (e.g. "External only") has no
+# saved monitors.xml entry. Smaller modes (4K, 1080p, ...) and the CTA audio
+# descriptors are kept intact: never picked while 5K is available, but they
+# preserve DisplayPort audio and a fallback if a link ever fails to train.
+# Forced DSC adds real bit depth (bpp 24-36, no FRC dithering) at ~40% link
+# load, and is only safe on the sub-60 timing — this script enforces that.
 #
 # Usage:
 #   studio-display status          what is running: mode, refresh, DSC, bpp, dither, link
-#   studio-display dsc on|off      force DSC on/off — remembered; a timer re-converges
-#                                  after mutter modesets (login/resume); --force bypasses guard
+#   studio-display dsc on|off      desired DSC state — remembered across boots;
+#                                  re-applied on replug/boot and re-checked every
+#                                  2 min (mutter silently clears the force flag
+#                                  on its own modesets); --force bypasses guard
 #   studio-display install         persist EDID via drm.edid_firmware + DSC convergence timer
 #   studio-display uninstall       reverse install
 set -u
 
 CONNECTOR="${STUDIO_DISPLAY_CONNECTOR:-DP-2}"
-EDID_NAME="apple-studio-display-5k-ladder.bin"
+EDID_NAME="apple-studio-display-5k.bin"
+LEGACY_NAME="apple-studio-display-5k-ladder.bin"   # pre single-mode build; purged on install
 FWREF="edid/$EDID_NAME"
 FW_PATH="/lib/firmware/edid/$EDID_NAME"
 # MUST be connector-scoped ("DP-2:...") or eDP would get this EDID too
@@ -136,8 +142,8 @@ cmd_status() {
         echo "  ⚠  5K not active"
     elif [ "$clock" -gt "$DSC_MAX_KHZ" ]; then
         echo "  ⚠  exact-60 Hz timing — known to tear on this panel."
-        echo "     Fix: Settings → Displays → Studio Display → 5120 x 2880 (59.94 Hz),"
-        echo "     or:  sudo studio-display dsc off   (then re-check)"
+        echo "     The single-mode EDID is not in effect (stock EDID loaded?)."
+        echo "     Fix: sudo studio-display install && reboot"
     else
         echo "  ✓  tear-free timing (clock ≤ ${DSC_MAX_KHZ} kHz)"
     fi
@@ -186,7 +192,8 @@ dsc_guard() {  # 0 = safe to force DSC; else prints reason
     clock=${a%% *}
     if [ "$clock" -gt "$DSC_MAX_KHZ" ]; then
         echo "active mode is ${clock} kHz (exact-60 timing): forced DSC blacks this panel."
-        echo "Switch to 59.94 Hz in Settings first, or pass --force."
+        echo "The single-mode EDID is not in effect (stock EDID loaded?). Re-run"
+        echo "'sudo studio-display install' and reboot, or pass --force."
         return 1
     fi
     return 0
@@ -265,6 +272,7 @@ cmd_install() {
     install -d -m0755 /lib/firmware/edid
     [ -f "$BINDIR/edid/$EDID_NAME" ] && install -m0644 "$BINDIR/edid/$EDID_NAME" "$FW_PATH"
     [ -f "$FW_PATH" ] || die "failed to install EDID to $FW_PATH"
+    rm -f "/lib/firmware/edid/$LEGACY_NAME"       # pre single-mode (ladder) build
 
     # self-install the CLI when run from a repo checkout
     [ "$BINDIR" != "/usr/local/bin" ] && install -m0755 "$(readlink -f "$0")" /usr/local/bin/studio-display
@@ -309,7 +317,7 @@ EOF
     # /lib/firmware/edid doesn't exist -> early "*ERROR* Requesting EDID
     # firmware failed" (harmless: userspace probes reload it in real root,
     # but this makes it deterministic and silent from t=0).
-    if command -v dracut >/dev/null 2>&1 && ! grep -qs "$EDID_NAME" /etc/dracut.conf.d/*edid*.conf; then
+    if command -v dracut >/dev/null 2>&1 && ! grep -qsF "$EDID_NAME" /etc/dracut.conf.d/*edid*.conf; then
         printf 'install_items+=" %s "\n' "$FW_PATH" > /etc/dracut.conf.d/apple-studio-display-edid.conf
         dracut -f >/dev/null 2>&1 || true
     fi
@@ -327,11 +335,12 @@ EOF
     printf 'reset' > "$DBG/edid_override" 2>/dev/null || true
 
     echo "Installed:"
-    echo "  EDID      : $FW_PATH (5K @ 50/54/56/58/59.94 Hz; stock 60.00 Hz removed)"
+    echo "  EDID      : $FW_PATH (only 5K mode: 5120x2880 @ 59.94 Hz; stock 60.00 removed)"
     echo "  boot param: $PARAM  (applies next boot; active now at runtime)"
     echo "  DSC arming: $TIMER (boot + every 2 min) + udev rule on replug"
     echo "              desired state in $MARKER — 'sudo studio-display dsc off' keeps it off"
-    echo "GNOME keeps 59.94 Hz via ~/.config/monitors.xml. Verify after a reboot with:"
+    echo "59.94 Hz is the only 5K mode GNOME can offer; a monitors.xml entry with a"
+    echo "stale rate falls back to it automatically. Verify after a reboot with:"
     echo "  studio-display status"
 }
 
@@ -355,7 +364,7 @@ cmd_uninstall() {
     systemctl daemon-reload; udevadm control --reload-rules
     echo "Removed kernel param, timer, udev rule, desired-state marker. Stock EDID"
     echo "returns on next detect (replug or reboot). Optional cleanup:"
-    echo "  sudo rm -f $FW_PATH /usr/local/bin/studio-display"
+    echo "  sudo rm -f $FW_PATH /lib/firmware/edid/$LEGACY_NAME /usr/local/bin/studio-display"
 }
 
 # ---- dispatch ---------------------------------------------------------------

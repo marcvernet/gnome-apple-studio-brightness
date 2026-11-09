@@ -22,14 +22,16 @@ mode; if stock 60.00 Hz were still advertised it would land exactly there
 
 ## Solution
 
-1. **EDID ladder** (`edid/apple-studio-display-5k-ladder.bin`): the stock
+1. **EDID, single mode** (`edid/apple-studio-display-5k.bin`): the stock
    EDID with its 5120x2880@60.00 DisplayID timing **rewritten to 59.94 Hz
-   (preferred flag kept)** plus one appended DisplayID block advertising
-   5120x2880 at **58/56/54/50 Hz** (same native porches: htot 5200, vtot
-   3000). 60.00 Hz appears nowhere and cannot be selected; 59.94 Hz is
-   now the *preferred* 5K mode, so even mutter's no-config fallback lands
-   on a clean timing. The choice is kept in `~/.config/monitors.xml`
-   (per output-set) and survives replug/reboot.
+   (preferred flag kept)** — and it is the *only* 5120x2880 timing the EDID
+   advertises. 60.00 Hz appears nowhere and cannot be selected; there is no
+   second 5K rate a saved `monitors.xml` entry (keyed per output-set) could
+   ever match, and the preferred-mode fallback a fresh arrangement
+   ("External only") relies on lands on the same clean timing. Smaller
+   modes (4K, 1080p, ...) and the CTA block's audio descriptors stay
+   untouched: never picked while 5K is available, they keep DisplayPort
+   audio working and provide a fallback if a link ever fails to train at 5K.
 2. **Forced DSC** (`i915_dsc_fec_support` + link retrain): the DP link runs
    Display Stream Compression, giving **full bit depth with no FRC
    dithering** (`dither=no`, bpp 24–36 depending on the negotiated depth) at
@@ -37,7 +39,7 @@ mode; if stock 60.00 Hz were still advertised it would land exactly there
    the panel, so the tool refuses to arm DSC there.
 3. **Persistence**: the EDID lives in `/lib/firmware/edid/` and is applied on
    every boot/hotplug via the kernel cmdline
-   `drm.edid_firmware=DP-2:edid/apple-studio-display-5k-ladder.bin`. The
+   `drm.edid_firmware=DP-2:edid/apple-studio-display-5k.bin`. The
    `DP-2:` prefix is **required** — an unprefixed value would override *every*
    connector including the laptop's eDP panel. `install` also drops a dracut
    config so the EDID is inside the initramfs (i915 probes from the initrd,
@@ -47,8 +49,10 @@ mode; if stock 60.00 Hz were still advertised it would land exactly there
    so a single "arm at boot" step always loses the race. Instead the desired
    state lives in `/var/lib/studio-display/dsc` and a systemd **timer**
    (boot + every 2 min) plus a hotplug udev rule converge the hardware to it.
-   Already-converged → instant no-op; `dsc off` is therefore **sticky** (it
-   moves the desired state, not just the flag).
+   This only ever re-asserts the DSC force flag — mode selection is entirely
+   the EDID's job, the timer never changes modes — and an already-converged
+   check is an instant no-op; `dsc off` is therefore **sticky** (it moves the
+   desired state, not just the flag).
 
 ## Use
 
@@ -66,7 +70,7 @@ sudo studio-display uninstall      # revert everything
 
 ```
 == Apple Studio Display (card1-DP-2, kernel ...) ==
-Connector   : connected   EDID: firmware /lib/firmware/edid/apple-studio-display-5k-ladder.bin (4 extensions)
+Connector   : connected   EDID: firmware /lib/firmware/edid/apple-studio-display-5k.bin (3 extensions)
 Mode        : 5120x2880 @ 59.94 Hz  (clock 935060 kHz, htot 5200, vtot 3000)
 Pipe        : bpp 36, dither no
 DSC         : on (force flag: on, desired: on)
@@ -81,9 +85,9 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
 
 | file | role |
 | ---- | ---- |
-| `build_ladder.py` | regenerates the EDID from `edid/apple-studio-display-stock.bin`: rewrites the stock 60.00 Hz 5K timing to 59.94 Hz and appends the sub-60 ladder (self-checks against the kernel's DisplayID parser; aborts if the 936000 kHz timing survives anywhere) |
+| `build_edid.py` | regenerates the EDID from `edid/apple-studio-display-stock.bin`: rewrites the stock 60.00 Hz 5K timing to 59.94 Hz (preferred) and asserts it is the *only* 5K timing left (self-checks against the kernel's DisplayID parser; aborts if the 936000 kHz poison timing survives anywhere) |
 | `edid/apple-studio-display-stock.bin` | stock EDID dumped from the panel |
-| `edid/apple-studio-display-5k-ladder.bin` | the override actually installed |
+| `edid/apple-studio-display-5k.bin` | the override actually installed (512 B, 3 extensions) |
 | `studio-display` | CLI: `status`, `dsc`, `install`, `uninstall`; installs its own systemd service + timer + udev rule |
 
 ## Notes & safety
@@ -100,7 +104,7 @@ EDID param  : drm.edid_firmware=edid/... (kernel cmdline, persistent)
   any extension makes the kernel drop **every** DisplayID timing of the whole
   EDID (observed: one corrupted checksum byte → `DisplayID checksum invalid,
   remainder is 149` in dmesg and *zero* 5K modes offered, not even the valid
-  ones). `build_ladder.py` asserts the kernel's checksum rule
+  ones). `build_edid.py` asserts the kernel's checksum rule
   (`sum(bytes 1..end-of-structure) == 0`) on every emitted block.
 * The force flag is cleared by connector re-detects and mode switches —
   that is why arming must happen *after* the mode commit. The convergence
